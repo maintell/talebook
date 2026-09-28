@@ -10,6 +10,7 @@ import tornado.escape
 from tornado import web
 
 from webserver import demo_mode, loader, utils
+from webserver.base_path import public_url
 from webserver.handlers.base import BaseHandler, auth, js
 from webserver.i18n import _
 from webserver.models import Device, Message, Reader
@@ -17,6 +18,7 @@ from webserver.plugins import captcha as captcha_module
 from webserver.plugins.push.base import PUSH_CAPABILITY
 from webserver.services.mail import MailService
 from webserver.services.plugin_runtime import PluginRuntime, ensure_runtime_installations
+from webserver.settings import settings as default_settings
 from webserver.version import VERSION
 
 
@@ -153,7 +155,7 @@ class UserUpdate(BaseHandler):
 
         ke = data.get("kindle_email", "").strip()
         if len(ke) > 0:
-            if not re.match(Reader.RE_EMAIL, ke):
+            if not Reader.is_valid_email(ke):
                 return {"err": "params.email.invalid", "msg": _("Kindle地址无效")}
             if user.extra is None:
                 user.extra = {"kindle_email": ke}
@@ -209,7 +211,7 @@ class SignUp(BaseHandler):
         if not nickname or not username or not password:
             return {"err": "params.invalid", "msg": _("用户名或密码无效")}
 
-        if not re.match(Reader.RE_EMAIL, email):
+        if not Reader.is_valid_email(email):
             return {"err": "params.email.invalid", "msg": _("Email无效")}
         if len(username) < 2 or len(username) > 20 or not re.match(Reader.RE_USERNAME, username):
             return {"err": "params.username.invalid", "msg": _("用户名无效")}
@@ -419,6 +421,11 @@ class UserInfo(BaseHandler):
             series_count = len(db.all_series())
             last_modified = db.last_modified().strftime("%Y-%m-%d")
 
+        sidebar_html = CONF["SIDEBAR_EXTRA_HTML"]
+        if sidebar_html == default_settings["SIDEBAR_EXTRA_HTML"]:
+            # Prefix only the built-in logo; administrator HTML stays untouched.
+            sidebar_html = sidebar_html.replace('src="/logo/link.png"', f'src="{public_url("/logo/link.png")}"')
+
         return {
             "books": books_count,
             "tags": tags_count,
@@ -435,7 +442,7 @@ class UserInfo(BaseHandler):
             "friends": CONF["FRIENDS"],
             "footer": CONF["FOOTER"],
             "footer_extra_html": CONF["FOOTER_EXTRA_HTML"],
-            "sidebar_extra_html": CONF["SIDEBAR_EXTRA_HTML"],
+            "sidebar_extra_html": sidebar_html,
             "header": CONF["HEADER"],
             "show_sidebar_sys": CONF.get("SHOW_SIDEBAR_SYS", True),
             "show_network_library": CONF.get("SHOW_NETWORK_LIBRARY", True),

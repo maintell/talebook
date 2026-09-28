@@ -12,6 +12,7 @@ import re
 import shutil
 import time
 import urllib
+from collections.abc import Mapping
 
 import tornado.escape
 from tornado import web
@@ -59,9 +60,11 @@ from webserver.services.external_index import (
     set_metadata_preserving_external_paths,
 )
 from webserver.services.extract import ExtractService
+from webserver.services.import_metadata import filename_metadata, matching_import_books
 from webserver.services.mail import MailService
 from webserver.services.media_analysis import (
     COMIC_CONTAINER_FORMATS,
+    MANAGED_DOCUMENT_FORMATS,
     InvalidMediaError,
     analyze_media_file,
     has_mixed_media_formats,
@@ -79,6 +82,36 @@ CONF = loader.get_settings()
 # 元数据来源可能发生不可取消的阻塞 I/O；全进程共享固定容量，避免每个
 # 请求各建线程池而让超时任务无限累积线程。
 _METADATA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="metadata-lookup")
+
+
+def reader_resource_revision(path):
+    stat = os.stat(path)
+    return "%x-%x" % (stat.st_mtime_ns, stat.st_size)
+
+
+def require_online_read_permission(handler, structured=False):
+    """Apply the permission policy shared by /read and reader resources."""
+    guest_like = not handler.current_user or demo_mode.is_demo_restricted(CONF, handler.current_user)
+    if guest_like:
+        if not CONF["ALLOW_GUEST_READ"]:
+            handler.redirect("/login")
+            return False
+    elif handler.current_user.can_read():
+        if not handler.current_user.is_active():
+            if structured:
+                handler.set_status(403)
+                handler.write({"err": "user.activation_required", "msg": _("请先激活账号")})
+                handler.finish()
+                return False
+            raise web.HTTPError(403, reason=_("无权在线阅读，请先登录注册邮箱激活账号。"))
+    else:
+        if structured:
+            handler.set_status(403)
+            handler.write({"err": "user.no_permission", "msg": _("无权在线阅读")})
+            handler.finish()
+            return False
+        raise web.HTTPError(403, reason=_("无权在线阅读"))
+    return True
 
 
 class Index(BaseHandler):
@@ -501,6 +534,8 @@ class BookRefer(BaseHandler):
         )
         if isinstance(outcome, Exception):
             raise outcome
+        if outcome is None:
+            raise PluginRuntimeError("metadata.not_found", "Selected metadata is no longer available")
         return to_calibre_metadata(outcome) or outcome
 
     def plugin_get_book_meta(self, provider_key, provider_value, mi):
@@ -558,6 +593,8 @@ class BookRefer(BaseHandler):
             try:
                 refer_mi = self._plugin_metadata_detail(provider_key, provider_value)
             except Exception as e:
+                if isinstance(e, PluginRuntimeError) and e.code == "metadata.not_found":
+                    raise RuntimeError({"err": "metadata.not_found", "msg": _("未获取到所选记录，请重新搜索")})
                 logging.error("插件 %s 元数据查询失败：%s", provider_key, e)
                 raise RuntimeError({"err": "httprequest.plugin.failed", "msg": _("插件查询失败")})
             if refer_mi is None:
@@ -728,7 +765,7 @@ class BookRefer(BaseHandler):
                 "provider_value": b.provider_value if hasattr(b, "provider_value") else "",
                 "pubdate": b.pubdate if hasattr(b, "pubdate") else None,
             }
-        elif not isinstance(b, dict):
+        elif not isinstance(b, Mapping):
             return None
 
         if "title" not in b or not b["title"]:
@@ -1032,6 +1069,7 @@ class BookDownload(BaseHandler, web.StaticFileHandler):
         self.root = "/"
         self.default_filename = None
         self.is_opds = self.get_argument("from", "") == "opds"
+        self.is_inline = self.get_argument("inline", "") == "1"
         BaseHandler.initialize(self)
 
     def prepare(self):
@@ -1075,12 +1113,11 @@ class BookDownload(BaseHandler, web.StaticFileHandler):
         if self.is_opds:
             att = 'attachment; filename="%(id)d.%(fmt)s"' % book
 
-        # PDF 文件使用 application/pdf，允许浏览器内联预览（供 pdfjs 等在线阅读器使用）
-        # 其他格式使用 application/octet-stream 强制下载
+        # PDF 保留正确的媒体类型；只有在线阅读入口显式要求时才内联展示。
+        # 普通下载和 OPDS 都必须返回 attachment，避免下载按钮退化为浏览器预览。
         if fmt == "pdf":
             self.set_header("Content-Type", "application/pdf")
-            # 在线阅读时不附加 Content-Disposition attachment，避免触发下载
-            if not self.is_opds:
+            if self.is_inline and not self.is_opds:
                 self.set_header("Content-Disposition", f'inline; filename="{fname}"'.encode("UTF-8"))
             else:
                 self.set_header("Content-Disposition", att.encode("UTF-8"))
@@ -1088,6 +1125,13 @@ class BookDownload(BaseHandler, web.StaticFileHandler):
             self.set_header("Content-Disposition", att.encode("UTF-8"))
             self.set_header("Content-Type", "application/octet-stream")
         return path
+
+    def get_content_type(self):
+        # StaticFileHandler sets this after parse_url_path; keep managed-only
+        # formats as downloads instead of using the host's MIME association.
+        if os.path.splitext(self.absolute_path)[1].lower().lstrip(".") in MANAGED_DOCUMENT_FORMATS:
+            return "application/octet-stream"
+        return super().get_content_type()
 
     @classmethod
     def get_absolute_path(cls, root: str, path: str) -> str:
@@ -1372,7 +1416,9 @@ class BookUploadBase(BaseHandler):
             return {"err": "params.format", "msg": _("文件校验失败：%s") % err.message}
 
         # 漫画容器不解压读取元数据，使用文件名构造最小 Calibre metadata。
-        if fmt in COMIC_CONTAINER_FORMATS:
+        if fmt in MANAGED_DOCUMENT_FORMATS:
+            mi = filename_metadata(fpath)
+        elif fmt in COMIC_CONTAINER_FORMATS:
             from calibre.ebooks.metadata.book.base import Metadata
 
             mi = Metadata(os.path.splitext(os.path.basename(fpath))[0], [_("佚名")])
@@ -1398,19 +1444,28 @@ class BookUploadBase(BaseHandler):
 
         if books:
             # 区分同名同作者和同名不同作者的书籍
-            for b in self.db.get_data_as_dict(ids=books):
+            candidates = self.db.get_data_as_dict(ids=books)
+            if fmt in MANAGED_DOCUMENT_FORMATS:
+                candidates = [
+                    book
+                    for book in candidates
+                    if self.current_user
+                    and self.current_user.can_edit()
+                    and (self.is_admin() or self.is_book_owner(book["id"], self.user_id()))
+                ]
+            for b in matching_import_books(mi, fmt, candidates):
                 book_authors = b.get("authors", [])
                 mi_authors = mi.authors
 
                 # 检查作者是否相同
-                if set(book_authors) == set(mi_authors):
+                if fmt in MANAGED_DOCUMENT_FORMATS or set(book_authors) == set(mi_authors):
                     same_author_book_id = b.get("id")
                     # 检查是否已存在相同格式。重传也会回填旧记录的媒体分类。
                     if fmt.upper() in b.get("available_formats", ""):
                         self._save_media_type(same_author_book_id, analysis.media_type)
                         return {
                             "err": "samebook",
-                            "msg": _("同名同作者书籍《%s》已存在这一图书格式 %s") % (mi.title, fmt),
+                            "msg": _("书籍《%s》已存在这一图书格式 %s") % (mi.title, fmt),
                             "book_id": same_author_book_id,
                         }
 
@@ -1669,9 +1724,9 @@ class BookUploadComplete(BookUploadBase):
 
 
 class BookRead(BaseHandler):
-    def render_epub(self, book, is_ready, audiobook_edition=None):
+    def render_epub(self, book, is_ready, audiobook_edition=None, viewer=None):
         return self.html_page(
-            "book/" + CONF["EPUB_VIEWER"],
+            "book/" + (viewer or CONF["EPUB_VIEWER"]),
             {
                 "book": book,
                 "epub_dir": "/get/extract/%s" % book["id"],
@@ -1682,17 +1737,9 @@ class BookRead(BaseHandler):
         )
 
     def get(self, id):
-        # 演示模式下，未登录访客与演示账号的在线阅读权限统一遵循“访客权限”配置，
-        # 忽略演示账号自身的权限位（该账号默认拥有完整权限，用于伪装管理员体验）。
         guest_like = not self.current_user or demo_mode.is_demo_restricted(CONF, self.current_user)
-        if guest_like:
-            if not CONF["ALLOW_GUEST_READ"]:
-                return self.redirect("/login")
-        elif self.current_user.can_read():
-            if not self.current_user.is_active():
-                raise web.HTTPError(403, reason=_("无权在线阅读，请先登录注册邮箱激活账号。"))
-        else:
-            raise web.HTTPError(403, reason=_("无权在线阅读"))
+        if not require_online_read_permission(self):
+            return
 
         book = self.get_book_or_404(id)
         book_id = book["id"]
@@ -1713,7 +1760,20 @@ class BookRead(BaseHandler):
         self.user_history("read_history", book)
         self.count_increase(book_id, count_download=1)
 
+        requested_reader = self.get_argument("reader", "")
+        use_readest = requested_reader == "readest" or (not requested_reader and CONF["EPUB_VIEWER"] == "readest")
+
         if book.get("fmt_epub"):
+            if use_readest:
+                launch_query = urllib.parse.urlencode({"bookId": str(book_id)})
+                return self.redirect("/readest/talebook-launch.html?%s" % launch_query)
+            if requested_reader == "candle":
+                return self.render_epub(
+                    book,
+                    is_ready=True,
+                    audiobook_edition=audiobook_edition,
+                    viewer="creader.html",
+                )
             return self.render_epub(book, is_ready=True, audiobook_edition=audiobook_edition)
 
         if "fmt_pdf" in book:
@@ -1724,14 +1784,25 @@ class BookRead(BaseHandler):
             elif not self.current_user.can_save():
                 raise web.HTTPError(403, reason=_("无权在线阅读PDF类书籍"))
 
-            pdf_url = urllib.parse.quote_plus(self.api_url + "/api/book/%(id)d.PDF" % book)
+            pdf_url = urllib.parse.quote_plus(self.api_url + "/api/book/%(id)d.PDF?inline=1" % book)
             pdf_reader_url = CONF["PDF_VIEWER"] % {"pdf_url": pdf_url}
             return self.redirect(pdf_reader_url)
 
         if "fmt_txt" in book:
-            # TXT有专门的阅读器
+            # Readest 是 EPUB 阅读器选项，TXT 始终使用专用阅读器。
             txt_reader_url = f"/book/{book_id}/readtxt"
             return self.redirect(txt_reader_url)
+
+        if use_readest and ConvertService().is_book_converting(book):
+            self.set_status(409)
+            return self.html_page(
+                "book/readest_error.html",
+                {
+                    "book": book,
+                    "error": "reader.conversion_pending",
+                    "message": _("本书正在转换为 EPUB，请稍后重试"),
+                },
+            )
 
         # 其他格式，转换为EPUB进行在线阅读
         for fmt in ["mobi", "azw", "azw3"]:
@@ -1740,8 +1811,125 @@ class BookRead(BaseHandler):
                 continue
 
             ConvertService().convert_and_save(self.user_id(), book, fpath, "epub")
-            return self.render_epub(book, is_ready=False, audiobook_edition=audiobook_edition)
+            return self.render_epub(
+                book,
+                is_ready=False,
+                audiobook_edition=audiobook_edition,
+                viewer="creader.html" if use_readest else None,
+            )
         raise web.HTTPError(404, reason=_("抱歉，在线阅读器暂不支持该格式的书籍"))
+
+
+class BookReaderBootstrap(BaseHandler):
+    @js
+    def get(self, id):
+        if self.get_argument("engine", "") != "readest":
+            self.set_status(400)
+            return {"err": "reader.engine_unsupported"}
+        if not require_online_read_permission(self, structured=True):
+            return
+        book = self.get_book(id, raise_exception=False)
+        if not book:
+            self.set_status(404)
+            return {"err": "book.not_found"}
+        fpath = book.get("fmt_epub")
+        if not fpath:
+            if ConvertService().is_book_converting(book):
+                self.set_status(409)
+                return {"err": "reader.conversion_pending"}
+            self.set_status(404)
+            return {"err": "reader.format_unsupported"}
+        revision = reader_resource_revision(fpath)
+        return {
+            "err": "ok",
+            "schema": "talebook.reader.bootstrap.v1",
+            "engine": "readest",
+            "book": {
+                "id": book["id"],
+                "title": book["title"],
+                "format": "epub",
+                "revision": revision,
+            },
+            "resource": {
+                "kind": "authorized-epub-url",
+                "url": "/read/resource/%d.epub?revision=%s" % (book["id"], revision),
+                "mime": "application/epub+zip",
+                "range": True,
+            },
+            "navigation": {
+                "back": "/book/%d" % book["id"],
+                "fallback": "/read/%d?reader=candle" % book["id"],
+            },
+            "capabilities": {
+                "readerCore": True,
+                "navigation": True,
+                "tableOfContents": True,
+                "textSearch": True,
+                "localPosition": True,
+                "localSettings": True,
+                "layoutSettings": True,
+                "appearanceSettings": True,
+                "languageSettings": True,
+                "customFonts": False,
+                "backgroundImages": False,
+                "annotations": False,
+                "serverProgress": False,
+                "pdf": False,
+                "dictionaries": False,
+                "translation": False,
+                "tts": False,
+                "library": False,
+                "account": False,
+                "auth": False,
+                "cloud": False,
+                "sync": False,
+                "payment": False,
+                "upgrade": False,
+                "updater": False,
+                "send": False,
+                "rss": False,
+                "opds": False,
+                "integrations": False,
+                "telemetry": False,
+                "aiAssistant": False,
+                "reedy": False,
+                "readestGateway": False,
+                "tauri": False,
+            },
+        }
+
+
+class BookReaderResource(BaseHandler, web.StaticFileHandler):
+    """Stream an EPUB using online-reading, rather than download, permission."""
+
+    def initialize(self):
+        self.root = "/"
+        self.default_filename = None
+        BaseHandler.initialize(self)
+
+    def prepare(self):
+        BaseHandler.prepare(self)
+        if not require_online_read_permission(self):
+            return
+
+    def parse_url_path(self, url_path):
+        match = re.fullmatch(r"([0-9]+)\.epub", url_path, re.IGNORECASE)
+        if not match:
+            raise web.HTTPError(404)
+        book = self.get_book_or_404(match.group(1))
+        fpath = book.get("fmt_epub")
+        if not fpath:
+            raise web.HTTPError(404, reason=_("EPUB 格式不存在"))
+        expected_revision = self.get_argument("revision", "")
+        if expected_revision and expected_revision != reader_resource_revision(fpath):
+            raise web.HTTPError(409, reason=_("EPUB 资源已更新，请重新加载"))
+        return fpath
+
+    def set_extra_headers(self, path):
+        self.set_header("Content-Type", "application/epub+zip")
+        self.set_header("Content-Disposition", 'inline; filename="book.epub"')
+        self.set_header("Cache-Control", "private, no-store")
+        self.set_header("X-Content-Type-Options", "nosniff")
 
 
 class TxtRead(BaseHandler):
@@ -2746,6 +2934,8 @@ def routes():
         (r"/api/book/([0-9]+)/separate", BookSeparate),
         (r"/api/book/([0-9]+)/savemeta", BookSaveMeta),
         (r"/read/([0-9]+)", BookRead),
+        (r"/read/resource/([0-9]+\.epub)", BookReaderResource),
+        (r"/api/book/([0-9]+)/reader-bootstrap", BookReaderBootstrap),
         (r"/api/read/txt", TxtRead),
         (r"/api/book/txt/init", BookTxtInit),
         (r"/api/book/([0-9]+)/favorite", BookFavorite),

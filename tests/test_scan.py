@@ -28,6 +28,12 @@ def write_supported_media(path, extension):
     if extension == "epub":
         with open(testdir + "/cases/new.epub", "rb") as source, open(path, "wb") as target:
             target.write(source.read())
+    elif extension == "djvu":
+        with open(path, "wb") as stream:
+            stream.write(b"AT&TFORM\x00\x00\x00\x04DJVU")
+    elif extension == "uvz":
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("0001.pdg", b"scanned page")
     elif extension == "pdf":
         with open(path, "wb") as stream:
             stream.write(b"%PDF-1.4 indexed test")
@@ -272,6 +278,72 @@ class TestScanContinue(TestWithUserLogin):
 
 class TestImport(TestWithUserLogin):
     READY_ROW_ID = 69
+
+    @mock.patch("webserver.services.scan.AutoFillService.auto_fill_all")
+    def test_long_titles_survive_scan_import_and_api(self, auto_fill):
+        from calibre.ebooks.metadata.book.base import Metadata
+        from calibre.ebooks.metadata.meta import set_metadata
+
+        legacy = self.get_app().settings["legacy"]
+        backend = legacy.new_api.backend
+        session = self.get_app().settings["ScopedSession"]
+        title = "命运攸关的抉择：1940-1941年间改变世界的十个决策"
+        with (
+            mock.patch.object(backend, "construct_path_name", main.utf8_construct_path_name),
+            mock.patch.object(backend, "construct_file_name", main.utf8_construct_file_name),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            for fmt in ("epub", "pdf", "txt"):
+                for mode in ("copy", "move", "index"):
+                    with self.subTest(fmt=fmt, mode=mode):
+                        # Distinct contents avoid scan hash deduplication between cases.
+                        expected = title + " " + fmt + " " + mode
+                        source = os.path.join(directory, expected + "." + fmt)
+                        write_supported_media(source, fmt)
+                        if fmt == "epub":
+                            with open(source, "r+b") as stream:
+                                set_metadata(stream, Metadata(expected, ["回归作者"]), "epub")
+                        else:
+                            with open(source, "ab") as stream:
+                                stream.write(expected.encode("utf-8"))
+                        row = None
+                        book_id = None
+                        try:
+                            ScanService().do_scan(directory)
+                            session.rollback()
+                            row = session.query(ScanFile).filter(ScanFile.path == source).one()
+                            self.assertEqual(row.status, ScanFile.READY)
+                            self.assertEqual(row.title, expected)
+
+                            ScanService().do_import([row.hash], 1, import_mode=mode)
+                            session.rollback()
+                            session.refresh(row)
+                            book_id = row.book_id
+                            self.assertEqual(row.status, ScanFile.INDEXED if mode == "index" else ScanFile.IMPORTED)
+                            self.assertEqual(legacy.new_api.field_for("title", book_id), expected)
+                            self.assertEqual(self.json("/api/book/%s" % book_id)["book"]["title"], expected)
+                            result = self.json("/api/search?name=" + urllib.parse.quote(expected))
+                            self.assertIn(expected, [book["title"] for book in result["books"]])
+
+                            stored = legacy.format_abspath(book_id, fmt.upper(), index_is_id=True)
+                            self.assertTrue(os.path.isfile(stored))
+                            if mode == "index":
+                                self.assertEqual(stored, source)
+                            else:
+                                self.assertTrue(os.path.basename(stored).startswith(main.safe_filename(expected) + " - "))
+                            self.assertEqual(os.path.exists(source), mode != "move")
+                        finally:
+                            if book_id:
+                                if mode == "index":
+                                    self._cleanup_external_books([book_id])
+                                else:
+                                    legacy.delete_book(book_id)
+                                    session.query(Item).filter(Item.book_id == book_id).delete()
+                            if row is not None:
+                                session.delete(row)
+                            session.commit()
+                            if os.path.exists(source):
+                                os.unlink(source)
 
     def _cleanup_external_books(self, book_ids):
         legacy = self.get_app().settings["legacy"]
@@ -738,6 +810,142 @@ class TestScanMetadataParseFailure(TestWithUserLogin):
 
             self.session.delete(row)
             self.session.commit()
+
+
+class TestScanBatchWindow(TestWithUserLogin):
+    """扫描批次名额不应被已登记处理完毕的文件占用
+
+    _do_scan()每轮从树根收集前limit个候选文件就停止。若已导入的文件也占名额，
+    copy/index模式下源文件常驻磁盘，前limit个名额永远被同一批旧文件占死，
+    扫描窗口卡在目录头部，其后的新文件永远扫不到。
+    修复后：已登记且处理完毕（非NEW状态、真实哈希）的路径在收集阶段被跳过，
+    名额只留给真正需要处理的文件；NEW状态行与fstat:临时哈希行仍占名额并照常重处理。
+    """
+
+    def setUp(self):
+        self.session = self.get_app().settings["ScopedSession"]
+        self.session.rollback()
+        return super().setUp()
+
+    def _write_pdf(self, tmpdir, name):
+        path = os.path.join(tmpdir, name + ".pdf")
+        with open(path, "wb") as f:
+            # 内容嵌入文件名，保证各文件真实哈希不同，避免触发真实哈希去重级联删除记录
+            f.write(("%%PDF-1.4 %s" % name).encode("utf-8"))
+        return path
+
+    def _tmpdir_rows(self, tmpdir):
+        return self.session.query(ScanFile).filter(ScanFile.path.startswith(tmpdir, autoescape=True)).all()
+
+    def _remove_tmpdir_rows(self, tmpdir):
+        for row in self._tmpdir_rows(tmpdir):
+            self.session.delete(row)
+        self.session.commit()
+
+    def _add_done_row(self, path, hash_index, scan_id=1000):
+        row = ScanFile(path, "sha256:%064d" % hash_index, scan_id)
+        row.status = ScanFile.IMPORTED
+        self.session.add(row)
+        return row
+
+    @staticmethod
+    def _mock_metadata():
+        from calibre.ebooks.metadata.book.base import Metadata
+
+        mi = Metadata("书名", ["佚名"])
+        mi.tags = []
+        mi.publisher = None
+        return mi
+
+    @mock.patch("calibre.ebooks.metadata.meta.get_metadata")
+    def test_done_files_do_not_block_batch_window(self, mock_get_metadata):
+        """已登记文件排满limit名额时，扫描仍应越过它们登记其后的新文件"""
+        mock_get_metadata.return_value = self._mock_metadata()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            done_a = self._write_pdf(tmpdir, "a_done1")
+            done_b = self._write_pdf(tmpdir, "b_done2")
+            new_c = self._write_pdf(tmpdir, "c_new1")
+            new_d = self._write_pdf(tmpdir, "d_new2")
+
+            self._add_done_row(done_a, 1)
+            self._add_done_row(done_b, 2)
+            self.session.commit()
+
+            ScanService()._do_scan(tmpdir, limit=2)
+            self.session.rollback()
+
+            for path, name in ((new_c, "c_new1"), (new_d, "d_new2")):
+                row = self.session.query(ScanFile).filter(ScanFile.path == path).first()
+                self.assertIsNotNone(row, "窗口应越过已登记文件，为其后的新文件%s建行" % name)
+                self.assertEqual(row.status, ScanFile.READY)
+
+            # 已登记文件不应被重复建行、也不应被重新登记
+            self.assertEqual(len(self._tmpdir_rows(tmpdir)), 4)
+            done_row = self.session.query(ScanFile).filter(ScanFile.path == done_a).first()
+            self.assertEqual(done_row.status, ScanFile.IMPORTED)
+            self.assertEqual(done_row.scan_id, 1000)
+
+            self._remove_tmpdir_rows(tmpdir)
+
+    @mock.patch("calibre.ebooks.metadata.meta.get_metadata")
+    def test_batch_limit_only_counts_unregistered_files(self, mock_get_metadata):
+        """名额只限制未登记文件：首轮恰好登记limit个，后续轮次窗口推进补齐剩余"""
+        mock_get_metadata.return_value = self._mock_metadata()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name in ("aaa", "bbb", "ccc"):
+                self._write_pdf(tmpdir, name)
+
+            ScanService()._do_scan(tmpdir, limit=2)
+            self.session.rollback()
+            self.assertEqual(len(self._tmpdir_rows(tmpdir)), 2, "首轮应恰好登记2个未登记文件")
+
+            ScanService()._do_scan(tmpdir, limit=2)
+            self.session.rollback()
+            self.assertEqual(len(self._tmpdir_rows(tmpdir)), 3, "第二轮窗口应推进到剩余文件")
+
+            self._remove_tmpdir_rows(tmpdir)
+
+    @mock.patch("calibre.ebooks.metadata.meta.get_metadata")
+    def test_new_and_temp_hash_rows_still_reprocessed(self, mock_get_metadata):
+        """NEW状态行与fstat:临时哈希行仍占名额并被重新处理，done行不受影响"""
+        mock_get_metadata.return_value = self._mock_metadata()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            new_path = self._write_pdf(tmpdir, "a_new_row")
+            done_path = self._write_pdf(tmpdir, "b_done")
+            fresh_path = self._write_pdf(tmpdir, "c_fresh")
+
+            new_row = ScanFile(new_path, "fstat:123/abc", 2000)
+            new_row.status = ScanFile.NEW
+            self.session.add(new_row)
+            self._add_done_row(done_path, 9, scan_id=2001)
+            self.session.commit()
+
+            ScanService()._do_scan(tmpdir, limit=1)
+            self.session.rollback()
+
+            done_row = self.session.query(ScanFile).filter(ScanFile.path == done_path).first()
+            self.assertEqual(done_row.scan_id, 2001, "done行不应被本轮重新登记")
+            self.assertEqual(done_row.status, ScanFile.IMPORTED)
+
+            fresh_row = self.session.query(ScanFile).filter(ScanFile.path == fresh_path).first()
+            new_row = self.session.query(ScanFile).filter(ScanFile.path == new_path).first()
+            processed = (1 if fresh_row else 0) + (1 if new_row and new_row.status == ScanFile.READY else 0)
+            self.assertEqual(processed, 1, "limit=1时本轮应恰好处理NEW行与全新文件中的一个")
+
+            ScanService()._do_scan(tmpdir, limit=1)
+            self.session.rollback()
+
+            fresh_row = self.session.query(ScanFile).filter(ScanFile.path == fresh_path).first()
+            new_row = self.session.query(ScanFile).filter(ScanFile.path == new_path).first()
+            self.assertIsNotNone(fresh_row, "第二轮应登记并处理剩余的全新文件")
+            self.assertIsNotNone(new_row)
+            self.assertEqual(fresh_row.status, ScanFile.READY)
+            self.assertEqual(new_row.status, ScanFile.READY)
+
+            self._remove_tmpdir_rows(tmpdir)
 
 
 class TestScanDuplicateDetection(TestWithUserLogin):

@@ -1,8 +1,12 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
 import { readFileSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { normalizeBasePath, withBasePath } from './utils/base-path'
+
+const basePath = normalizeBasePath(process.env.TALEBOOK_BASE_PATH || '')
 
 export default defineNuxtConfig({
+    vite: { define: { 'import.meta.env.TALEBOOK_BASE_PATH': JSON.stringify(basePath) } },
     compatibilityDate: '2024-04-03',
     devtools: { enabled: true },
     ignore: [
@@ -39,21 +43,54 @@ export default defineNuxtConfig({
         }
     },
     runtimeConfig: {
+        api_url: process.env.API_URL || 'http://127.0.0.1:8080',
         public: {
             api_url: process.env.API_URL || 'http://127.0.0.1:8080',
             site_title: process.env.TITLE || 'talebook',
         }
     },
     routeRules: {
+        '/readest/legacy-worker-cleanup.js': {
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'X-Content-Type-Options': 'nosniff',
+            },
+        },
+        '/readest/talebook-launch.html': {
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'X-Content-Type-Options': 'nosniff',
+            },
+        },
+        '/readest/talebook-launch.js': {
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'X-Content-Type-Options': 'nosniff',
+            },
+        },
+        '/readest/sw.js': {
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Service-Worker-Allowed': '/',
+            },
+        },
+        '/readest/**': {
+            headers: {
+                'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' data:; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob:; font-src 'self' data:; object-src 'none'; frame-src blob:; worker-src 'self' blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+                'Cross-Origin-Opener-Policy': 'same-origin',
+                'Cross-Origin-Embedder-Policy': 'require-corp',
+                'X-Content-Type-Options': 'nosniff',
+            },
+        },
         '/api/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/api/**' },
         '/get/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/get/**' },
-        '/read/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/read/**' },
         '/read-comic/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/read-comic/**' },
         '/books/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/books/**' },
         '/media/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/media/**' },
         '/static/themes/**': { proxy: (process.env.API_URL || 'http://127.0.0.1:8080') + '/static/themes/**' },
     },
     app: {
+        baseURL: basePath + "/",
         head: {
             title: 'talebook',
             titleTemplate: '%s | talebook',
@@ -67,7 +104,10 @@ export default defineNuxtConfig({
                 },
             ],
             link: [
-                { rel: 'shortcut icon', type: 'image/x-icon', href: '/logo/favicon.ico' }
+                { rel: 'shortcut icon', type: 'image/x-icon', href: withBasePath('/logo/favicon.ico', basePath) }
+            ],
+            script: [
+                { type: 'module', src: withBasePath('/readest/legacy-worker-cleanup.js', basePath) }
             ]
         }
     },
